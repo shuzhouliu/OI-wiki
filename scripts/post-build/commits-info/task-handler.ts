@@ -3,11 +3,76 @@ import child_process from "child_process";
 import chalk from "chalk";
 import { HTMLElement } from "node-html-parser";
 import fetch from "node-fetch";
+import * as path from "node:path";
+import * as fs from "node:fs/promises";
 
 import { AuthorsCache, AuthorUserMap, fetchAuthors } from "./authors-cache.js";
 import { TaskHandler, log } from "../html-postprocess.js";
 
 const execFileAsync = util.promisify(child_process.execFile);
+
+async function readCommitsLogRepoPath(repoRelPath: string): Promise<{ commitDate: Date; authorEmails: string[] }[]> {
+  const { stdout: log } = await execFileAsync(
+    "bash",
+    [
+      "-c",
+      `git log --follow '--pretty=format:>%cD%n<%aE%n%w(0,2,2)%b' $FILENAME | sed -nE 's/^((>.+)|(<.+)|  Co-Authored-By: .+?(<.+)>)/\\2\\3\\4/pi'`
+    ],
+    { env: { ...process.env, FILENAME: repoRelPath } }
+  );
+
+  const commits = log.trim() ? log.trim().slice(1).split("\n>") : [];
+  return commits.map(commit => {
+    const [dateLine, ...emailLines] = commit
+      .split("\n")
+      .map(line => line.trim())
+      .filter(Boolean);
+    return {
+      commitDate: new Date(dateLine),
+      authorEmails: Array.from(new Set(emailLines.map(emailLine => emailLine.slice(1).toLowerCase())))
+    };
+  });
+}
+
+async function readCommitsLogFromRef(refPath: string) {
+  const clean = refPath.replace(/^\/+/, "");
+  const repoRel = path.posix.join("docs", clean);
+  return readCommitsLogRepoPath(repoRel);
+}
+
+async function findIncludedPaths(refPath: string): Promise<string[]> {
+  const clean = refPath.replace(/^\/+/, ""); // "math/fft.md"
+  const mdRepoRel = path.posix.join("docs", clean); // "docs/math/fft.md"
+  let content = "";
+  try {
+    content = await fs.readFile(mdRepoRel, "utf-8");
+  } catch {
+    return [];
+  }
+
+  const includes: string[] = [];
+  const re = /--8<--\s*"(.*?)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(content))) {
+    const raw = m[1].trim();
+    let repoRel: string;
+
+    if (raw.startsWith("docs/")) {
+      repoRel = raw;
+    } else if (raw.startsWith("/")) {
+      repoRel = path.posix.join("docs", raw.replace(/^\/+/, ""));
+    } else {
+      const mdDir = path.posix.dirname(mdRepoRel);
+      repoRel = path.posix.normalize(path.posix.join(mdDir, raw));
+    }
+
+    if (repoRel.startsWith("docs/")) {
+      includes.push(repoRel);
+    }
+  }
+
+  return Array.from(new Set(includes));
+}
 
 async function readCommitsLog(sourceFilePath: string): Promise<{ commitDate: Date; authorEmails: string[] }[]> {
   const { stdout: log } = await execFileAsync(
@@ -95,16 +160,25 @@ export const taskHandler = new (class implements TaskHandler<AuthorUserMap> {
       // Set link to git history
       $(".edit_history").setAttribute("href", `https://github.com/${GITHUB_REPO}/commits/master/docs${sourceFilePath}`);
 
-      const commitsLog = await readCommitsLog(sourceFilePath);
+      const commitsLogMain = await readCommitsLogFromRef(sourceFilePath);
+
+      const includeRepoPaths = await findIncludedPaths(sourceFilePath);
+      const includeLogs = await Promise.all(includeRepoPaths.map(p => readCommitsLogRepoPath(p)));
+
+      const allLogs = [commitsLogMain, ...includeLogs].flat();
 
       // "本页面最近更新"
-      const latestDate = new Date(
-        commitsLog.map(l => +new Date(l.commitDate)).reduce((latest, current) => Math.max(latest, current))
-      );
+      const latestDate = new Date(Math.max(...allLogs.map(l => +l.commitDate)));
       $(".facts_modified").textContent =
-        latestDate.toLocaleDateString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false }) +
+        latestDate.toLocaleDateString("zh-CN", {
+          timeZone: "Asia/Shanghai",
+          hour12: false
+        }) +
         " " +
-        latestDate.toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
+        latestDate.toLocaleTimeString("zh-CN", {
+          timeZone: "Asia/Shanghai",
+          hour12: false
+        });
 
       // "本页面贡献者"
       const authors = Object.entries(
@@ -116,7 +190,7 @@ export const taskHandler = new (class implements TaskHandler<AuthorUserMap> {
             .split(",")
             .map(username => `${username.trim()}\ngithub`),
           // From git history
-          ...commitsLog
+          ...allLogs
             .flatMap(l => l.authorEmails)
             .filter(email => email in this.userMap)
             .map(
